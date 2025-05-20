@@ -148,13 +148,21 @@ def calculate_growth_opencl(context, queue, df_zillow, zip_codes, start_date_str
     first_date_col_index = -1
     all_date_cols_dt = {}
     for i, col_name in enumerate(df_zillow.columns):
-        if isinstance(col_name, str) and (col_name.count('-') == 1 or col_name.count('-') == 2):
+        if isinstance(col_name, str) and (col_name.count('-') == 1 or col_name.count('-') == 2): # Zillow uses YYYY-MM or YYYY-MM-DD
             try:
-                dt = pd.to_datetime(col_name, errors='raise')
-                all_date_cols_dt[col_name] = dt
+                # Attempt to parse, be flexible with day part if missing (assume first of month)
+                if col_name.count('-') == 1: # YYYY-MM
+                    dt_candidate = pd.to_datetime(col_name + '-01', errors='raise')
+                else: # YYYY-MM-DD
+                    dt_candidate = pd.to_datetime(col_name, errors='raise')
+
+                all_date_cols_dt[col_name] = dt_candidate
                 if first_date_col_index == -1: first_date_col_index = i
-            except (ValueError, TypeError): continue
-    if first_date_col_index == -1: raise ValueError("Could not identify date columns.")
+            except (ValueError, TypeError):
+                # print(f"Debug: Could not parse column '{col_name}' as date.") # Optional debug
+                continue
+    if first_date_col_index == -1: raise ValueError("Could not identify any date columns in the Zillow data.")
+
 
     actual_start_col, actual_end_col = None, None
     min_start_diff, min_end_diff = pd.Timedelta.max, pd.Timedelta.max
@@ -162,13 +170,30 @@ def calculate_growth_opencl(context, queue, df_zillow, zip_codes, start_date_str
     for col, dt in all_date_cols_dt.items():
         if dt >= target_start_dt:
             diff = dt - target_start_dt
-            if diff < min_start_diff: min_start_diff, actual_start_col = diff, col
+            if diff < min_start_diff:
+                min_start_diff, actual_start_col = diff, col
+            # If multiple columns have the same minimum difference (e.g. same day), prefer the one that is also closest to the end of its month if data is EOM
+            elif diff == min_start_diff and dt.is_month_end:
+                 actual_start_col = col
+
+
         if dt <= target_end_dt:
             diff = target_end_dt - dt
-            if diff < min_end_diff: min_end_diff, actual_end_col = diff, col
+            if diff < min_end_diff:
+                min_end_diff, actual_end_col = diff, col
+            elif diff == min_end_diff and dt.is_month_end:
+                actual_end_col = col
 
-    if actual_start_col is None or actual_end_col is None or actual_start_col == actual_end_col:
-        raise ValueError(f"Could not find valid start/end date columns near {start_date_str}/{end_date_str}.")
+
+    if actual_start_col is None or actual_end_col is None:
+        err_msg = "Could not find suitable date columns. "
+        if actual_start_col is None: err_msg += f"No data found on or after start date {start_date_str}. "
+        if actual_end_col is None: err_msg += f"No data found on or before end date {end_date_str}. "
+        raise ValueError(err_msg)
+
+    if all_date_cols_dt[actual_start_col] > all_date_cols_dt[actual_end_col]:
+        raise ValueError(f"Selected start date '{actual_start_col}' ({all_date_cols_dt[actual_start_col]:%Y-%m-%d}) is after selected end date '{actual_end_col}' ({all_date_cols_dt[actual_end_col]:%Y-%m-%d}). Try a later start or earlier end date.")
+
     print(f"Using actual data columns: Start='{actual_start_col}', End='{actual_end_col}'")
 
     # --- 2. Prepare Price Data for OpenCL ---
@@ -176,7 +201,7 @@ def calculate_growth_opencl(context, queue, df_zillow, zip_codes, start_date_str
     df_state = df_zillow[df_zillow['RegionName'].isin(zip_codes)].copy()
     # Select only the ZIP code and the two relevant date columns
     price_data = df_state[['RegionName', actual_start_col, actual_end_col]].set_index('RegionName')
-    # Reindex to ensure all requested zips are present (index is already strings)
+    # Reindex to ensure all requested zips are present and in order (index is already strings)
     price_data = price_data.reindex(zip_codes)
 
     num_zips = len(price_data)
@@ -242,7 +267,7 @@ def calculate_growth_opencl(context, queue, df_zillow, zip_codes, start_date_str
         raise RuntimeError(f"Failed to copy results from device. CL Error Code: {e.code}")
 
     # --- 6. Format Results ---
-    # Create DataFrame with results, using the original string index
+    # Create DataFrame with results, using the original string index from price_data
     results_df = pd.DataFrame({'GrowthPercentage': results_np}, index=price_data.index)
     # Replace the marker with actual NaN for pandas operations
     results_df['GrowthPercentage'] = results_df['GrowthPercentage'].replace(NAN_MARKER, np.nan)
@@ -286,11 +311,13 @@ def analyze_and_plot(selected_state, start_date_str, end_date_str):
         results_df, actual_start, actual_end = calculate_growth_opencl(
             context, queue, df_zillow, zip_codes_to_analyze, start_date_str, end_date_str
         )
-    except Exception as e:
+    except Exception as e: # Catch specific ValueErrors from date finding too
+        print(f"Error during OpenCL calculation or date finding: {e}") # Log for debugging
         raise gr.Error(f"Growth calculation failed: {e}")
 
+
     if results_df.empty:
-        raise gr.Error(f"No valid growth data calculated for any ZIP in {selected_state} between {start_date_str} and {end_date_str} (using actual dates {actual_start} to {actual_end}).")
+        raise gr.Error(f"No valid growth data calculated for any ZIP in {selected_state} between {start_date_str} and {end_date_str} (using actual dates {actual_start} to {actual_end}). This could be due to lack of data for the period or issues with selected dates.")
 
     # --- Create Histogram Plot ---
     print("Generating growth histogram...")
@@ -306,10 +333,22 @@ def analyze_and_plot(selected_state, start_date_str, end_date_str):
     p10 = results_df['GrowthPercentage'].quantile(0.10) * 100
     p90 = results_df['GrowthPercentage'].quantile(0.90) * 100
 
-    fig_hist.add_vline(x=p10, line_dash="dash", line_color="yellow", annotation_text=f"10th Perc: {p10:.1f}%")
-    fig_hist.add_vline(x=median_growth, line_dash="dash", line_color="red", annotation_text=f"Median: {median_growth:.1f}%")
-    fig_hist.add_vline(x=p90, line_dash="dash", line_color="yellow", annotation_text=f"90th Perc: {p90:.1f}%")
-    fig_hist.add_vline(x=mean_growth, line_dash="dot", line_color="cyan", annotation_text=f"Mean: {mean_growth:.1f}%")
+    # MODIFIED SECTION FOR ANNOTATION POSITIONING
+    fig_hist.add_vline(x=p10, line_dash="dash", line_color="yellow",
+                        annotation_text=f"10th Perc: {p10:.1f}%",
+                        annotation_position="top left")
+
+    fig_hist.add_vline(x=median_growth, line_dash="dash", line_color="red",
+                        annotation_text=f"Median: {median_growth:.1f}%",
+                        annotation_position="bottom right") # Changed from "top" to avoid mean if close
+
+    fig_hist.add_vline(x=p90, line_dash="dash", line_color="yellow",
+                        annotation_text=f"90th Perc: {p90:.1f}%",
+                        annotation_position="top right")
+
+    fig_hist.add_vline(x=mean_growth, line_dash="dot", line_color="cyan",
+                        annotation_text=f"Mean: {mean_growth:.1f}%",
+                        annotation_position="top") # Kept as "top", usually distinct enough from P10/P90 edges
 
     fig_hist.update_layout(
         title=f'{selected_state} ZHVI Growth Distribution<br><sup>({actual_start} to {actual_end})</sup>',
@@ -365,17 +404,19 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="cyan", secondary_hue="teal")
                 value=DEFAULT_STATE
             )
             # Date Inputs
-            start_date_input = gr.Textbox(label="Start Date", value=DEFAULT_START_DATE, placeholder="YYYY-MM-DD")
-            end_date_input = gr.Textbox(label="End Date", value=DEFAULT_END_DATE, placeholder="YYYY-MM-DD")
+            start_date_input = gr.Textbox(label="Start Date", value=DEFAULT_START_DATE, placeholder="YYYY-MM-DD or YYYY-MM")
+            end_date_input = gr.Textbox(label="End Date", value=DEFAULT_END_DATE, placeholder="YYYY-MM-DD or YYYY-MM")
             run_button = gr.Button("Calculate State Growth", variant="primary")
 
         with gr.Column(scale=2):
-             # Output for the summary table - REMOVED headers argument
+             # Output for the summary table
              summary_output = gr.DataFrame(
-                 label="ZIP Code Growth Summary (Sample)",
-                 # headers=['ZIP Code', 'GrowthPercentage'], # Let Gradio infer headers
-                 interactive=False
-            )
+                 label="ZIP Code Growth Summary (Top 1000)",
+                 interactive=False,
+                 # For Gradio 4.x and later, headers are typically inferred or can be controlled differently
+                 # For older versions, ensure it's a list of strings:
+                 # headers=['ZIP Code', 'GrowthPercentage'] # This might be needed for specific Gradio versions
+             )
              gr.Markdown("*Table shows calculated growth for each valid ZIP, sorted descending. May show a sample if >1000 ZIPs analyzed.*")
 
 
@@ -395,9 +436,9 @@ with gr.Blocks(theme=gr.themes.Default(primary_hue="cyan", secondary_hue="teal")
     gr.Examples(
         examples=[
             ["NJ", "2015-01-31", "2023-12-31"],
-            ["CA", "2018-01-31", "2024-03-31"],
+            ["CA", "2018-01", "2024-03"], # Example with YYYY-MM
             ["FL", "2012-01-31", "2022-12-31"],
-            ["TX", "2016-01-31", "2023-06-30"],
+            ["TX", "2016-06", "2023-06-30"], # Mixed example
             ["CO", "2019-01-31", "2024-03-31"],
         ],
         # Ensure example inputs match the function signature order
